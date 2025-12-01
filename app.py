@@ -71,7 +71,9 @@ DISEASE_CLASSES = list(DISEASE_INFO.keys())
 # ---------------------------
 # Model helpers
 # ---------------------------
-DEVICE = torch.device("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
+# Streamlit Cloud does not support GPU, so always use CPU
+DEVICE = torch.device("cpu")
+
 
 def safe_load_model(path="model_checkpoint.pth"):
     """
@@ -478,3 +480,4 @@ if st.session_state["page"] == "app":
 # Footer
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown('<div style="text-align:center;color:rgba(230,220,255,0.7)">Built with ❤️ — educational tool only. Not a medical diagnosis.</div>', unsafe_allow_html=True)
+
