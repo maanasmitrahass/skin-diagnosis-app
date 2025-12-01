@@ -1,8 +1,11 @@
 streamlit==1.28.1
-torch>=2.6.0
-torchvision
 Pillow==10.0.0
 numpy==1.24.3
-matplotlib
-pandas
-dir
+pandas==2.2.2
+firebase-admin>=6.0.0
+google-generativeai
+bcrypt
+# PyTorch + torchvision CPU wheels (Streamlit Cloud friendly)
+torch==2.2.0+cpu
+torchvision==0.17.0+cpu
+-f https://download.pytorch.org/whl/cpu/torch_stable.html
