@@ -371,9 +371,14 @@ def page_login():
                 go("home")
             else:
                 st.error("Incorrect password.")
-    st.markdown('<div style="margin-top:10px">Not registered? <span class="signup-link" onclick="document.querySelectorAll(\\'button\\')[0].click()">Sign up</span></div>', unsafe_allow_html=True)
+
+    # friendly signup prompt and reliable button
+    st.write("Not registered? Click the button below to create an account.")
+    if st.button("Sign up", key="signup_button"):
+        go("register")
+
     # visible fallback link/button
-    if st.button("Create an account", key="signup_visible"):
+    if st.button("Create an account (alternate)", key="signup_visible"):
         go("register")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -563,8 +568,7 @@ def footer_safe():
     try:
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown('<div style="text-align:center;color:rgba(230,220,255,0.7)">Built with ❤️</div>', unsafe_allow_html=True)
-    except Exception as e:
-        # swallow footer errors — show tiny fallback
+    except Exception:
         try:
             st.write("Built with ❤️")
         except Exception:
