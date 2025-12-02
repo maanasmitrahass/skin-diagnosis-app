@@ -1,15 +1,14 @@
 # app.py
 """
-Royal Skin Diagnosis - Supabase integrated single-file Streamlit app.
-- Uses supabase for DB + Storage when configured (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET)
-- Falls back to local session storage if not configured
-- Optional Gemini / HuggingFace integration for AI
-- PBKDF2 password hashing (no bcrypt)
+Royal Skin Diagnosis — Streamlit app with Supabase persistence.
+- Reads SUPABASE_URL, SUPABASE_KEY, SUPABASE_BUCKET from Streamlit secrets
+- Optional GENAI (Gemini) and HF (Hugging Face) integration for AI answers
+- Local fallback storage if cloud isn't configured
+- PBKDF2 password hashing
 """
 
 import os
 import io
-import json
 import time
 import base64
 import hashlib
@@ -21,88 +20,85 @@ from PIL import Image
 import requests
 
 # -------------------------
-# Page config (first Streamlit call)
+# Page config (must be first Streamlit call)
 # -------------------------
 st.set_page_config(page_title="Royal Skin Diagnosis", layout="centered", initial_sidebar_state="expanded")
 
 # -------------------------
-# Read secrets / env
+# Read secrets
 # -------------------------
+SUPABASE_URL = st.secrets.get("SUPABASE_URL") if "SUPABASE_URL" in st.secrets else os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") if "SUPABASE_KEY" in st.secrets else os.environ.get("SUPABASE_KEY")
+SUPABASE_BUCKET = st.secrets.get("SUPABASE_BUCKET") if "SUPABASE_BUCKET" in st.secrets else os.environ.get("SUPABASE_BUCKET", "records")
+
 GENAI_API_KEY = st.secrets.get("GENAI_API_KEY") if "GENAI_API_KEY" in st.secrets else os.environ.get("GENAI_API_KEY")
 HF_API_TOKEN = st.secrets.get("HF_API_TOKEN") if "HF_API_TOKEN" in st.secrets else os.environ.get("HF_API_TOKEN")
 HF_MODEL = st.secrets.get("HF_MODEL") if "HF_MODEL" in st.secrets else os.environ.get("HF_MODEL")
 
-SUPABASE_URL = st.secrets.get("SUPABASE_URL") if "SUPABASE_URL" in st.secrets else os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY") if "SUPABASE_SERVICE_ROLE_KEY" in st.secrets else os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-SUPABASE_BUCKET = st.secrets.get("SUPABASE_BUCKET") if "SUPABASE_BUCKET" in st.secrets else os.environ.get("SUPABASE_BUCKET", "diagnoses")
-
 # -------------------------
-# Optional Google Generative AI (Gemini)
+# Try to init Gemini (optional)
 # -------------------------
 USE_GENAI = False
 if GENAI_API_KEY:
     try:
-        import google.generativeai as genai
+        import google.generativeai as genai  # optional
         genai.configure(api_key=GENAI_API_KEY)
         USE_GENAI = True
     except Exception:
         USE_GENAI = False
 
 # -------------------------
-# Optional Supabase init
+# Supabase init (cached)
 # -------------------------
 SUPABASE_AVAILABLE = False
 supabase = None
 
 @st.cache_resource(show_spinner=False)
-def init_supabase():
-    global SUPABASE_AVAILABLE, supabase
-    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+def init_supabase_client():
+    global SUPABASE_AVAILABLE
+    if not (SUPABASE_URL and SUPABASE_KEY):
         return None
     try:
         from supabase import create_client
-        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
         SUPABASE_AVAILABLE = True
         return client
     except Exception as e:
-        st.warning("Supabase init failed (continuing with local storage).")
+        st.warning("Supabase client init failed — running in local mode.")
         return None
 
-_supabase_client = init_supabase()
-if _supabase_client:
-    supabase = _supabase_client
+supabase = init_supabase_client()
 
 # -------------------------
-# Disease metadata (expand as needed)
+# Fallback disease info
 # -------------------------
 DISEASE_INFO = {
     "Melanoma": {"severity":"high", "description":"Potentially life-threatening skin cancer.", "precautions":"Avoid sun; see dermatologist urgently.", "medications":"Surgery/oncology-managed therapies."},
-    "Basal Cell Carcinoma": {"severity":"high", "description":"Common skin cancer; treatable when detected early.", "precautions":"Dermatologist consult; sun protection.", "medications":"Surgical excision, topical options."},
-    "Psoriasis": {"severity":"low", "description":"Chronic autoimmune skin condition causing scaly plaques.", "precautions":"Moisturize; avoid triggers.", "medications":"Topical steroids, vitamin D analogues."},
-    "Nevus": {"severity":"low", "description":"Benign mole in most cases.", "precautions":"Monitor for changes in size/colour.", "medications":"Not needed unless suspicious."},
-    "Actinic Keratosis": {"severity":"medium", "description":"Sun-damaged precancerous lesion.", "precautions":"Sun protection; dermatology review.", "medications":"Cryotherapy, topical 5-FU or diclofenac."}
+    "Psoriasis": {"severity":"low", "description":"Chronic autoimmune scaly plaques.", "precautions":"Moisturize; avoid triggers.", "medications":"Topical steroids, vitamin D analogues."},
+    "Nevus": {"severity":"low", "description":"Common benign mole.", "precautions":"Monitor for changes.", "medications":"Usually none."},
+    "Actinic Keratosis": {"severity":"medium", "description":"Sun-damaged precancerous lesion.", "precautions":"Sun protection; dermatology review.", "medications":"Cryotherapy or topical therapies."}
 }
 
 # -------------------------
-# Hashing helpers (PBKDF2)
+# Password hashing (PBKDF2)
 # -------------------------
 def hash_password(pw: str) -> str:
     salt = os.urandom(16)
-    key = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, 200000)
+    key = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, 200_000)
     return "pbkdf2$" + binascii.hexlify(salt).decode() + "$" + binascii.hexlify(key).decode()
 
 def check_password(pw: str, stored: str) -> bool:
     try:
-        tag, salt_hex, key_hex = stored.split("$")
+        _, salt_hex, key_hex = stored.split("$")
         salt = binascii.unhexlify(salt_hex)
         key = binascii.unhexlify(key_hex)
-        new_key = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, 200000)
-        return binascii.hexlify(new_key) == binascii.hexlify(key)
+        new_key = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, 200_000)
+        return binascii.hexlify(new_key) == key
     except Exception:
         return False
 
 # -------------------------
-# Local session fallback stores
+# Local fallback session stores
 # -------------------------
 if "local_users" not in st.session_state:
     st.session_state["local_users"] = {}
@@ -126,18 +122,14 @@ def local_get_user(email: str):
     return st.session_state.get("local_users", {}).get(email)
 
 # -------------------------
-# Supabase helpers (DB + Storage)
+# Supabase helpers
 # -------------------------
 def upload_image_to_supabase(path: str, image_bytes: bytes, content_type="image/jpeg"):
-    """Upload bytes to Supabase Storage, return public URL or None."""
     if not supabase:
         return None
     try:
-        # upload to bucket (path must be unique)
-        # supabase.storage.from_(bucket).upload(path, file) - when using supabase-py:
-        # call storage().from_('bucket').upload(...)
-        res = supabase.storage().from_(SUPABASE_BUCKET).upload(path, image_bytes)
-        # Build public URL: /storage/v1/object/public/{bucket}/{path}
+        bucket = supabase.storage().from_(SUPABASE_BUCKET)
+        bucket.upload(path, io.BytesIO(image_bytes), content_type=content_type)
         public_url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
         return public_url
     except Exception as e:
@@ -145,12 +137,10 @@ def upload_image_to_supabase(path: str, image_bytes: bytes, content_type="image/
         return None
 
 def save_record_supabase(record: dict):
-    """Insert record into `diagnoses` table. Return True/False."""
     if not supabase:
         return False
     try:
-        res = supabase.table("diagnoses").insert(record).execute()
-        # check for errors
+        res = supabase.table("records").insert(record).execute()
         if hasattr(res, "error") and res.error:
             st.warning(f"Supabase insert error: {res.error}")
             return False
@@ -177,7 +167,7 @@ def get_user_supabase(email: str):
         return None
     try:
         res = supabase.table("users").select("*").eq("email", email).limit(1).execute()
-        data = res.data if hasattr(res, "data") else getattr(res, "json", lambda: None)()
+        data = getattr(res, "data", None) or (res.json() if hasattr(res, "json") else None)
         if data and isinstance(data, list) and len(data) > 0:
             return data[0]
         return None
@@ -189,15 +179,15 @@ def get_records_supabase(email: str):
     if not supabase:
         return []
     try:
-        res = supabase.table("diagnoses").select("*").eq("user_email", email).order("timestamp", desc=True).execute()
-        data = res.data if hasattr(res, "data") else getattr(res, "json", lambda: None)()
+        res = supabase.table("records").select("*").eq("user_email", email).order("timestamp", desc=True).execute()
+        data = getattr(res, "data", None) or (res.json() if hasattr(res, "json") else None)
         return data or []
     except Exception as e:
         st.warning(f"Supabase read records failed: {e}")
         return []
 
 # -------------------------
-# Diagnosis backends (same as before)
+# Predictors (dummy / HF / optional GenAI)
 # -------------------------
 def dummy_predict(image_bytes=None):
     return "Nevus", 0.42
@@ -208,7 +198,7 @@ def hf_predict(image_bytes: bytes):
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
     api_url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
     try:
-        response = requests.post(api_url, headers=headers, files={"file": image_bytes}, timeout=60)
+        response = requests.post(api_url, headers=headers, files={"file": ("image.jpg", image_bytes)}, timeout=60)
         response.raise_for_status()
         data = response.json()
         if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
@@ -227,8 +217,7 @@ def genai_vision_predict(image_bytes: bytes):
         model = genai.GenerativeModel("models/gemini-2.5-pro")
         prompt = "You are an experienced dermatologist. Look at the image and provide a single-line disease label only."
         response = model.generate_content([prompt, {"mime_type":"image/jpeg", "data": image_bytes}])
-        text = ""
-        if hasattr(response, "text"):
+        if hasattr(response, "text") and response.text:
             text = response.text.strip()
         elif isinstance(response, dict):
             text = response.get("content", "")
@@ -237,7 +226,7 @@ def genai_vision_predict(image_bytes: bytes):
         label = text.splitlines()[0] if text else "Unknown"
         return label, 0.0
     except Exception as e:
-        st.warning(f"Gemini vision inference failed: {e}")
+        st.warning(f"GenAI vision failed: {e}")
         return dummy_predict(image_bytes)
 
 def diagnose_image(image_bytes: bytes):
@@ -254,14 +243,15 @@ def diagnose_image(image_bytes: bytes):
     return dummy_predict(image_bytes)
 
 # -------------------------
-# Chat / QA (descriptive)
+# AI answer
 # -------------------------
 def genai_answer_question(disease_label: str, question: str):
     if not USE_GENAI:
         info = DISEASE_INFO.get(disease_label, {})
-        return (f"Summary for {disease_label}:\n\n"
+        return (f"**Summary for {disease_label}:**\n\n"
                 f"{info.get('description','No description available.')}\n\n"
-                f"Precautions: {info.get('precautions','Follow general precautions.')}\n\n"
+                f"**Precautions:** {info.get('precautions','Follow general precautions.')}\n\n"
+                f"**Treatment / Medications:** {info.get('medications','Consult a dermatologist.')}\n\n"
                 f"If symptoms are severe or rapidly changing, consult a dermatologist.")
     try:
         model = genai.GenerativeModel("models/gemini-2.5-pro")
@@ -271,10 +261,7 @@ def genai_answer_question(disease_label: str, question: str):
             "(3) recommended first-line home care, (4) medical treatments used, (5) red flags when to seek a doctor, "
             "(6) common medication classes, and (7) suggested next steps."
         )
-        user_prompt = (
-            f"Disease: {disease_label}\nPatient question: {question}\n\n"
-            "Please provide a detailed, structured reply in numbered sections as described above."
-        )
+        user_prompt = f"Disease: {disease_label}\nUser question: {question}\nPlease answer in numbered sections."
         response = model.generate_content([system_prompt, user_prompt], temperature=0.2, max_output_tokens=800)
         if hasattr(response, "text") and response.text:
             return response.text
@@ -292,27 +279,17 @@ st.markdown("""
 .royal-card { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border:1px solid rgba(155,77,255,0.08); border-radius:12px; padding:12px; margin-bottom:10px;}
 h1,h2,h3 { color:#f7ecff !important; }
 .small-muted { color: rgba(230,220,255,0.8); }
+.big-btn { background: linear-gradient(90deg,#ffecf8, #f0e6ff); border-radius:10px; padding:8px; }
 </style>
 """, unsafe_allow_html=True)
 
 # -------------------------
-# Page flow helpers
+# Pages and flow
 # -------------------------
-def go_home():
-    st.session_state["page"] = "welcome"
+def go(page_name):
+    st.session_state["page"] = page_name
     st.experimental_rerun()
 
-def go_login():
-    st.session_state["page"] = "login"
-    st.experimental_rerun()
-
-def go_register():
-    st.session_state["page"] = "register"
-    st.experimental_rerun()
-
-# -------------------------
-# Pages (Welcome / Register / Login / Home / Profile / Diagnose)
-# -------------------------
 def page_welcome():
     st.markdown('<div class="royal-card">', unsafe_allow_html=True)
     st.title("👑 Royal Skin Diagnosis")
@@ -320,10 +297,10 @@ def page_welcome():
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Login"):
-            go_login()
+            go("login")
     with c2:
         if st.button("Register"):
-            go_register()
+            go("register")
     st.markdown("</div>", unsafe_allow_html=True)
 
 def page_register():
@@ -348,7 +325,6 @@ def page_register():
             if avatar:
                 b = avatar.read()
                 st.session_state["last_avatar_bytes"] = b
-                # upload avatar to supabase storage if available
                 if SUPABASE_AVAILABLE and supabase:
                     try:
                         path = f"profiles/{email.replace('@','_at_')}_{int(time.time())}.jpg"
@@ -360,9 +336,9 @@ def page_register():
             if SUPABASE_AVAILABLE and supabase:
                 ok = save_user_supabase(user_doc)
                 if ok:
-                    st.success("Account created (cloud). Please login.")
+                    st.success("Account created in cloud. Please log in.")
                 else:
-                    st.error("Cloud save failed; created locally.")
+                    st.error("Cloud save failed; saved locally.")
                     local_store_user(user_doc)
             else:
                 local_store_user(user_doc)
@@ -375,10 +351,7 @@ def page_login():
     if st.button("Login"):
         user_doc = None
         if SUPABASE_AVAILABLE and supabase:
-            try:
-                user_doc = get_user_supabase(em)
-            except Exception:
-                user_doc = None
+            user_doc = get_user_supabase(em)
         if not user_doc:
             user_doc = local_get_user(em)
         if not user_doc:
@@ -408,9 +381,8 @@ def page_profile():
     with col1:
         avatar = user.get("avatar")
         if isinstance(avatar, (bytes, bytearray)):
-            from io import BytesIO
-            st.image(BytesIO(avatar), width=140)
-        elif isinstance(avatar, str) and (avatar.startswith("http") or avatar.startswith("https")):
+            st.image(avatar, width=140)
+        elif isinstance(avatar, str) and avatar.startswith("http"):
             try:
                 st.image(avatar, width=140)
             except Exception:
@@ -430,8 +402,8 @@ def page_profile():
                 st.info("No cloud records found for this user.")
             else:
                 for r in recs:
-                    with st.expander(f"{r.get('disease')} — {r.get('timestamp','')}"):
-                        st.write(f"**Disease:** {r.get('disease')}")
+                    with st.expander(f"{r.get('diagnosis')} — {r.get('timestamp','')}"):
+                        st.write(f"**Diagnosis:** {r.get('diagnosis')}")
                         st.write(f"**Confidence:** {r.get('confidence')}")
                         if r.get("image_url"):
                             try:
@@ -444,11 +416,11 @@ def page_profile():
         else:
             recs = st.session_state.get("local_records", [])
             if not recs:
-                st.info("No local records found. Diagnose & save a record first.")
+                st.info("No local records found.")
             else:
                 for r in recs[::-1]:
-                    with st.expander(f"{r.get('disease')} — {r.get('timestamp','')}"):
-                        st.write(f"**Disease:** {r.get('disease')}")
+                    with st.expander(f"{r.get('diagnosis')} — {r.get('timestamp','')}"):
+                        st.write(f"**Diagnosis:** {r.get('diagnosis')}")
                         st.write(f"**Confidence:** {r.get('confidence')}")
                         if r.get("image_b64"):
                             st.image(base64.b64decode(r.get("image_b64")), use_column_width=True)
@@ -459,7 +431,7 @@ def page_diagnose():
     uploaded = st.file_uploader("Upload skin image (jpg/png)", type=["jpg","jpeg","png"])
     if uploaded:
         try:
-            img = Image.open(uploaded)
+            img = Image.open(uploaded).convert("RGB")
             st.image(img, caption="Uploaded image", use_column_width=True)
         except Exception:
             st.error("Could not open image.")
@@ -479,7 +451,7 @@ def page_diagnose():
                 st.markdown(f"**Precautions:** {info.get('precautions','Follow general precautions.')}")
                 st.markdown(f"**Treatment / Medications:** {info.get('medications','Consult a dermatologist.')}")
                 severity = info.get("severity","low")
-                if severity == "high" or conf > 0.85:
+                if severity == "high" or (isinstance(conf, float) and conf > 0.85):
                     st.warning("This looks potentially serious. Please consult a dermatologist promptly.")
                     st.markdown("[Book a dermatologist on Practo](https://www.practo.com/dermatologist)")
 
@@ -489,26 +461,24 @@ def page_diagnose():
                     else:
                         rec = {
                             "user_email": st.session_state["user"]["email"],
-                            "disease": label,
+                            "diagnosis": label,
                             "confidence": float(conf),
                             "timestamp": datetime.utcnow().isoformat()
                         }
                         saved_cloud = False
                         if SUPABASE_AVAILABLE and supabase:
                             try:
-                                # upload image to storage
-                                path = f"diagnoses/{st.session_state['user']['email'].replace('@','_at_')}/{int(time.time())}.jpg"
+                                path = f"records/{st.session_state['user']['email'].replace('@','_at_')}/{int(time.time())}.jpg"
                                 url = upload_image_to_supabase(path, img_bytes, content_type="image/jpeg")
                                 if url:
                                     rec["image_url"] = url
                             except Exception:
                                 pass
 
-                            # attempt to save to supabase
                             ok = save_record_supabase(rec)
                             if ok:
                                 saved_cloud = True
-                                st.success("Saved to Supabase cloud.")
+                                st.success("Saved to cloud.")
                             else:
                                 st.error("Cloud save failed; saved locally.")
                         if not saved_cloud:
