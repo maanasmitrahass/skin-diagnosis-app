@@ -1,11 +1,10 @@
 # app.py
 """
-Royal Skin Diagnosis - Full working Streamlit app (single-file)
-- No torch dependency (safe for Streamlit Cloud)
-- PBKDF2 password hashing fallback (no bcrypt required)
-- Gemini/Hugging Face optional integration for diagnosis & chat
-- Firebase Firestore + Storage optional (controlled by secrets)
-- Profile view shows saved records (cloud or local) and avatars
+Royal Skin Diagnosis - Supabase integrated single-file Streamlit app.
+- Uses supabase for DB + Storage when configured (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET)
+- Falls back to local session storage if not configured
+- Optional Gemini / HuggingFace integration for AI
+- PBKDF2 password hashing (no bcrypt)
 """
 
 import os
@@ -33,8 +32,9 @@ GENAI_API_KEY = st.secrets.get("GENAI_API_KEY") if "GENAI_API_KEY" in st.secrets
 HF_API_TOKEN = st.secrets.get("HF_API_TOKEN") if "HF_API_TOKEN" in st.secrets else os.environ.get("HF_API_TOKEN")
 HF_MODEL = st.secrets.get("HF_MODEL") if "HF_MODEL" in st.secrets else os.environ.get("HF_MODEL")
 
-FIREBASE_SERVICE_ACCOUNT_JSON = st.secrets.get("FIREBASE_SERVICE_ACCOUNT_JSON") if "FIREBASE_SERVICE_ACCOUNT_JSON" in st.secrets else None
-FIREBASE_STORAGE_BUCKET = st.secrets.get("FIREBASE_STORAGE_BUCKET") if "FIREBASE_STORAGE_BUCKET" in st.secrets else os.environ.get("FIREBASE_STORAGE_BUCKET")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL") if "SUPABASE_URL" in st.secrets else os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY") if "SUPABASE_SERVICE_ROLE_KEY" in st.secrets else os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_BUCKET = st.secrets.get("SUPABASE_BUCKET") if "SUPABASE_BUCKET" in st.secrets else os.environ.get("SUPABASE_BUCKET", "diagnoses")
 
 # -------------------------
 # Optional Google Generative AI (Gemini)
@@ -49,39 +49,31 @@ if GENAI_API_KEY:
         USE_GENAI = False
 
 # -------------------------
-# Optional Firebase init (lazy)
+# Optional Supabase init
 # -------------------------
-FIREBASE_AVAILABLE = False
-db = None
-bucket = None
+SUPABASE_AVAILABLE = False
+supabase = None
 
 @st.cache_resource(show_spinner=False)
-def init_firebase():
-    global FIREBASE_AVAILABLE, db, bucket
-    if not (FIREBASE_SERVICE_ACCOUNT_JSON and FIREBASE_STORAGE_BUCKET):
+def init_supabase():
+    global SUPABASE_AVAILABLE, supabase
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
         return None
     try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore, storage as fb_storage
-        cred_dict = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
-        cred = credentials.Certificate(cred_dict)
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
-        db_local = firestore.client()
-        bucket_local = fb_storage.bucket()
-        FIREBASE_AVAILABLE = True
-        return db_local, bucket_local
+        from supabase import create_client
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        SUPABASE_AVAILABLE = True
+        return client
     except Exception as e:
-        # Do not crash — return None and fallback to local storage
-        st.warning("Firebase init failed (continuing with local storage).")
+        st.warning("Supabase init failed (continuing with local storage).")
         return None
 
-_firebase = init_firebase()
-if _firebase:
-    db, bucket = _firebase
+_supabase_client = init_supabase()
+if _supabase_client:
+    supabase = _supabase_client
 
 # -------------------------
-# Disease metadata (expand as you like)
+# Disease metadata (expand as needed)
 # -------------------------
 DISEASE_INFO = {
     "Melanoma": {"severity":"high", "description":"Potentially life-threatening skin cancer.", "precautions":"Avoid sun; see dermatologist urgently.", "medications":"Surgery/oncology-managed therapies."},
@@ -90,10 +82,9 @@ DISEASE_INFO = {
     "Nevus": {"severity":"low", "description":"Benign mole in most cases.", "precautions":"Monitor for changes in size/colour.", "medications":"Not needed unless suspicious."},
     "Actinic Keratosis": {"severity":"medium", "description":"Sun-damaged precancerous lesion.", "precautions":"Sun protection; dermatology review.", "medications":"Cryotherapy, topical 5-FU or diclofenac."}
 }
-DISEASE_CLASSES = list(DISEASE_INFO.keys())
 
 # -------------------------
-# Hashing helpers (PBKDF2 fallback)
+# Hashing helpers (PBKDF2)
 # -------------------------
 def hash_password(pw: str) -> str:
     salt = os.urandom(16)
@@ -135,35 +126,78 @@ def local_get_user(email: str):
     return st.session_state.get("local_users", {}).get(email)
 
 # -------------------------
-# Firebase helpers
+# Supabase helpers (DB + Storage)
 # -------------------------
-def upload_image_to_storage(path: str, image_bytes: bytes, content_type="image/jpeg"):
-    if not bucket:
+def upload_image_to_supabase(path: str, image_bytes: bytes, content_type="image/jpeg"):
+    """Upload bytes to Supabase Storage, return public URL or None."""
+    if not supabase:
         return None
     try:
-        blob = bucket.blob(path)
-        blob.upload_from_string(image_bytes, content_type=content_type)
-        try:
-            blob.make_public()
-            return blob.public_url
-        except Exception:
-            return f"gs://{blob.bucket.name}/{blob.name}"
+        # upload to bucket (path must be unique)
+        # supabase.storage.from_(bucket).upload(path, file) - when using supabase-py:
+        # call storage().from_('bucket').upload(...)
+        res = supabase.storage().from_(SUPABASE_BUCKET).upload(path, image_bytes)
+        # Build public URL: /storage/v1/object/public/{bucket}/{path}
+        public_url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
+        return public_url
     except Exception as e:
-        st.error(f"Upload failed: {e}")
+        st.warning(f"Supabase upload failed: {e}")
         return None
 
-def save_record_cloud(record: dict):
-    if not db:
+def save_record_supabase(record: dict):
+    """Insert record into `diagnoses` table. Return True/False."""
+    if not supabase:
         return False
     try:
-        db.collection("diagnoses").add(record)
+        res = supabase.table("diagnoses").insert(record).execute()
+        # check for errors
+        if hasattr(res, "error") and res.error:
+            st.warning(f"Supabase insert error: {res.error}")
+            return False
         return True
     except Exception as e:
-        st.error(f"Cloud save failed: {e}")
+        st.warning(f"Supabase save failed: {e}")
         return False
 
+def save_user_supabase(user_doc: dict):
+    if not supabase:
+        return False
+    try:
+        res = supabase.table("users").insert(user_doc).execute()
+        if hasattr(res, "error") and res.error:
+            st.warning(f"Supabase user insert error: {res.error}")
+            return False
+        return True
+    except Exception as e:
+        st.warning(f"Supabase user save failed: {e}")
+        return False
+
+def get_user_supabase(email: str):
+    if not supabase:
+        return None
+    try:
+        res = supabase.table("users").select("*").eq("email", email).limit(1).execute()
+        data = res.data if hasattr(res, "data") else getattr(res, "json", lambda: None)()
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]
+        return None
+    except Exception as e:
+        st.warning(f"Supabase read user failed: {e}")
+        return None
+
+def get_records_supabase(email: str):
+    if not supabase:
+        return []
+    try:
+        res = supabase.table("diagnoses").select("*").eq("user_email", email).order("timestamp", desc=True).execute()
+        data = res.data if hasattr(res, "data") else getattr(res, "json", lambda: None)()
+        return data or []
+    except Exception as e:
+        st.warning(f"Supabase read records failed: {e}")
+        return []
+
 # -------------------------
-# Diagnosis backends
+# Diagnosis backends (same as before)
 # -------------------------
 def dummy_predict(image_bytes=None):
     return "Nevus", 0.42
@@ -241,7 +275,6 @@ def genai_answer_question(disease_label: str, question: str):
             f"Disease: {disease_label}\nPatient question: {question}\n\n"
             "Please provide a detailed, structured reply in numbered sections as described above."
         )
-        # Adjust params if your SDK supports; otherwise plain call
         response = model.generate_content([system_prompt, user_prompt], temperature=0.2, max_output_tokens=800)
         if hasattr(response, "text") and response.text:
             return response.text
@@ -278,7 +311,7 @@ def go_register():
     st.experimental_rerun()
 
 # -------------------------
-# Pages
+# Pages (Welcome / Register / Login / Home / Profile / Diagnose)
 # -------------------------
 def page_welcome():
     st.markdown('<div class="royal-card">', unsafe_allow_html=True)
@@ -315,20 +348,22 @@ def page_register():
             if avatar:
                 b = avatar.read()
                 st.session_state["last_avatar_bytes"] = b
-                if FIREBASE_AVAILABLE and bucket:
+                # upload avatar to supabase storage if available
+                if SUPABASE_AVAILABLE and supabase:
                     try:
                         path = f"profiles/{email.replace('@','_at_')}_{int(time.time())}.jpg"
-                        url = upload_image_to_storage(path, b, content_type="image/jpeg")
+                        url = upload_image_to_supabase(path, b, content_type="image/jpeg")
                         if url:
                             user_doc["avatar_url"] = url
                     except Exception:
                         pass
-            if FIREBASE_AVAILABLE and db:
-                try:
-                    db.collection("users").add(user_doc)
+            if SUPABASE_AVAILABLE and supabase:
+                ok = save_user_supabase(user_doc)
+                if ok:
                     st.success("Account created (cloud). Please login.")
-                except Exception as e:
-                    st.error(f"Cloud save failed: {e}")
+                else:
+                    st.error("Cloud save failed; created locally.")
+                    local_store_user(user_doc)
             else:
                 local_store_user(user_doc)
                 st.success("Local account created. (Cloud not configured.)")
@@ -339,11 +374,9 @@ def page_login():
     pw = st.text_input("Password", type="password", key="login_pw")
     if st.button("Login"):
         user_doc = None
-        if FIREBASE_AVAILABLE and db:
+        if SUPABASE_AVAILABLE and supabase:
             try:
-                q = db.collection("users").where("email","==",em).limit(1).get()
-                if q and len(q) > 0:
-                    user_doc = q[0].to_dict()
+                user_doc = get_user_supabase(em)
             except Exception:
                 user_doc = None
         if not user_doc:
@@ -352,7 +385,7 @@ def page_login():
             st.error("No such user. Please register.")
         else:
             if check_password(pw, user_doc["password_hash"]):
-                st.session_state["user"] = {"email": user_doc["email"], "name": user_doc.get("name"), "phone": user_doc.get("phone"), "avatar": user_doc.get("avatar_url") if FIREBASE_AVAILABLE else st.session_state.get("last_avatar_bytes")}
+                st.session_state["user"] = {"email": user_doc["email"], "name": user_doc.get("name"), "phone": user_doc.get("phone"), "avatar": user_doc.get("avatar_url") if SUPABASE_AVAILABLE else st.session_state.get("last_avatar_bytes")}
                 st.success("Logged in.")
                 st.session_state["page"] = "home"
                 st.experimental_rerun()
@@ -377,7 +410,7 @@ def page_profile():
         if isinstance(avatar, (bytes, bytearray)):
             from io import BytesIO
             st.image(BytesIO(avatar), width=140)
-        elif isinstance(avatar, str) and (avatar.startswith("http") or avatar.startswith("gs://")):
+        elif isinstance(avatar, str) and (avatar.startswith("http") or avatar.startswith("https")):
             try:
                 st.image(avatar, width=140)
             except Exception:
@@ -388,31 +421,26 @@ def page_profile():
         st.write(f"**Name:** {user.get('name')}")
         st.write(f"**Email:** {user.get('email')}")
         st.write(f"**Phone:** {user.get('phone')}")
-        st.write("Cloud: " + ("Connected" if FIREBASE_AVAILABLE else "Not configured (local mode)"))
+        st.write("Cloud: " + ("Connected" if SUPABASE_AVAILABLE else "Not configured (local mode)"))
 
     if st.button("View saved records"):
-        if FIREBASE_AVAILABLE and db:
-            try:
-                docs = db.collection("diagnoses").where("user_email","==", user["email"]).order_by("timestamp", direction="DESCENDING").limit(100).stream()
-                recs = [d.to_dict() for d in docs]
-                if not recs:
-                    st.info("No cloud records found for this user.")
-                else:
-                    for r in recs:
-                        with st.expander(f"{r.get('disease')} — {r.get('timestamp','')}"):
-                            st.write(f"**Disease:** {r.get('disease')}")
-                            st.write(f"**Confidence:** {r.get('confidence')}")
-                            if r.get("image_url"):
-                                try:
-                                    st.image(r.get("image_url"), use_column_width=True)
-                                except Exception:
-                                    st.write("Image not available.")
-                            elif r.get("image_b64"):
-                                st.image(base64.b64decode(r.get("image_b64")), use_column_width=True)
-                            st.json(r)
-            except Exception as e:
-                st.error(f"Failed to read cloud records: {e}")
-                st.write(st.session_state.get("local_records", []))
+        if SUPABASE_AVAILABLE and supabase:
+            recs = get_records_supabase(user["email"])
+            if not recs:
+                st.info("No cloud records found for this user.")
+            else:
+                for r in recs:
+                    with st.expander(f"{r.get('disease')} — {r.get('timestamp','')}"):
+                        st.write(f"**Disease:** {r.get('disease')}")
+                        st.write(f"**Confidence:** {r.get('confidence')}")
+                        if r.get("image_url"):
+                            try:
+                                st.image(r.get("image_url"), use_column_width=True)
+                            except Exception:
+                                st.write("Image not available.")
+                        elif r.get("image_b64"):
+                            st.image(base64.b64decode(r.get("image_b64")), use_column_width=True)
+                        st.json(r)
         else:
             recs = st.session_state.get("local_records", [])
             if not recs:
@@ -465,26 +493,26 @@ def page_diagnose():
                             "confidence": float(conf),
                             "timestamp": datetime.utcnow().isoformat()
                         }
-                        if FIREBASE_AVAILABLE and bucket:
+                        saved_cloud = False
+                        if SUPABASE_AVAILABLE and supabase:
                             try:
+                                # upload image to storage
                                 path = f"diagnoses/{st.session_state['user']['email'].replace('@','_at_')}/{int(time.time())}.jpg"
-                                url = upload_image_to_storage(path, img_bytes, content_type="image/jpeg")
+                                url = upload_image_to_supabase(path, img_bytes, content_type="image/jpeg")
                                 if url:
                                     rec["image_url"] = url
                             except Exception:
                                 pass
-                        else:
-                            rec["image_b64"] = base64.b64encode(img_bytes).decode("utf-8")
 
-                        saved_cloud = False
-                        if FIREBASE_AVAILABLE and db:
-                            try:
-                                db.collection("diagnoses").add(rec)
+                            # attempt to save to supabase
+                            ok = save_record_supabase(rec)
+                            if ok:
                                 saved_cloud = True
-                                st.success("Saved to cloud.")
-                            except Exception as e:
-                                st.error(f"Cloud save failed: {e}\nSaved locally instead.")
+                                st.success("Saved to Supabase cloud.")
+                            else:
+                                st.error("Cloud save failed; saved locally.")
                         if not saved_cloud:
+                            rec["image_b64"] = base64.b64encode(img_bytes).decode("utf-8")
                             st.session_state["local_records"].append(rec)
                             st.success("Saved locally.")
     else:
