@@ -6,8 +6,8 @@ Royal Skin Diagnosis — Streamlit app with Supabase persistence.
 - Local fallback storage if cloud isn't configured
 - PBKDF2 password hashing
 """
-
 import os
+os.environ["WATCHDOG_USE_POLLING"] = "1"
 import io
 import time
 import base64
@@ -555,3 +555,4 @@ def footer():
 if __name__ == "__main__":
     main()
     footer()
+
