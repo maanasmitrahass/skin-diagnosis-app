@@ -548,11 +548,9 @@ def main():
     else:
         page_welcome()
 
-def footer():
-    st.markdown("<hr>", unsafe_allow_html=True)
-    st.markdown('<div style="text-align:center;color:rgba(230,220,255,0.7)">Built with ❤️ — educational tool only. Not a medical diagnosis.</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
     footer()
+
 
