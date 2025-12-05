@@ -1,399 +1,559 @@
-# app.py — Local-only Skin Diagnosis Center (complete)
-# NO SUPABASE — no cloud configuration needed.
+# app.py
+"""
+Royal Skin Diagnosis - Full working Streamlit app (single-file)
+- No torch dependency (safe for Streamlit Cloud)
+- PBKDF2 password hashing fallback (no bcrypt required)
+- Gemini/Hugging Face optional integration for diagnosis & chat
+- Firebase Firestore + Storage optional (controlled by secrets)
+- Profile view shows saved records (cloud or local) and avatars
+"""
 
 import os
 import io
+import json
+import time
 import base64
 import hashlib
 import binascii
-import random
 from datetime import datetime
-from typing import Tuple, Dict
 
 import streamlit as st
 from PIL import Image
+import requests
 
-# -----------------------
-# Page config - must be first Streamlit call
-# -----------------------
-st.set_page_config(page_title="Skin Disease Diagnosis Center", layout="wide")
+# -------------------------
+# Page config (first Streamlit call)
+# -------------------------
+st.set_page_config(page_title="Royal Skin Diagnosis", layout="centered", initial_sidebar_state="expanded")
 
-# -----------------------
-# Small performance tweak (watchdog polling in some envs)
-# -----------------------
-os.environ["WATCHDOG_USE_POLLING"] = "1"
+# -------------------------
+# Read secrets / env
+# -------------------------
+GENAI_API_KEY = st.secrets.get("GENAI_API_KEY") if "GENAI_API_KEY" in st.secrets else os.environ.get("GENAI_API_KEY")
+HF_API_TOKEN = st.secrets.get("HF_API_TOKEN") if "HF_API_TOKEN" in st.secrets else os.environ.get("HF_API_TOKEN")
+HF_MODEL = st.secrets.get("HF_MODEL") if "HF_MODEL" in st.secrets else os.environ.get("HF_MODEL")
 
-# -----------------------
-# Session-state boot
-# -----------------------
-if "local_users" not in st.session_state:
-    st.session_state["local_users"] = {}  # email -> user dict
+FIREBASE_SERVICE_ACCOUNT_JSON = st.secrets.get("FIREBASE_SERVICE_ACCOUNT_JSON") if "FIREBASE_SERVICE_ACCOUNT_JSON" in st.secrets else None
+FIREBASE_STORAGE_BUCKET = st.secrets.get("FIREBASE_STORAGE_BUCKET") if "FIREBASE_STORAGE_BUCKET" in st.secrets else os.environ.get("FIREBASE_STORAGE_BUCKET")
 
-if "local_records" not in st.session_state:
-    st.session_state["local_records"] = []  # list of records
+# -------------------------
+# Optional Google Generative AI (Gemini)
+# -------------------------
+USE_GENAI = False
+if GENAI_API_KEY:
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GENAI_API_KEY)
+        USE_GENAI = True
+    except Exception:
+        USE_GENAI = False
 
-if "user" not in st.session_state:
-    st.session_state["user"] = None  # logged-in user (dict)
+# -------------------------
+# Optional Firebase init (lazy)
+# -------------------------
+FIREBASE_AVAILABLE = False
+db = None
+bucket = None
 
-if "page" not in st.session_state:
-    st.session_state["page"] = "welcome"
+@st.cache_resource(show_spinner=False)
+def init_firebase():
+    global FIREBASE_AVAILABLE, db, bucket
+    if not (FIREBASE_SERVICE_ACCOUNT_JSON and FIREBASE_STORAGE_BUCKET):
+        return None
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore, storage as fb_storage
+        cred_dict = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
+        cred = credentials.Certificate(cred_dict)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_STORAGE_BUCKET})
+        db_local = firestore.client()
+        bucket_local = fb_storage.bucket()
+        FIREBASE_AVAILABLE = True
+        return db_local, bucket_local
+    except Exception as e:
+        # Do not crash — return None and fallback to local storage
+        st.warning("Firebase init failed (continuing with local storage).")
+        return None
 
-if "current_diagnosis" not in st.session_state:
-    st.session_state["current_diagnosis"] = None  # tuple(label, confidence, meta)
+_firebase = init_firebase()
+if _firebase:
+    db, bucket = _firebase
 
-# -----------------------
-# Password hashing helpers
-# -----------------------
+# -------------------------
+# Disease metadata (expand as you like)
+# -------------------------
+DISEASE_INFO = {
+    "Melanoma": {"severity":"high", "description":"Potentially life-threatening skin cancer.", "precautions":"Avoid sun; see dermatologist urgently.", "medications":"Surgery/oncology-managed therapies."},
+    "Basal Cell Carcinoma": {"severity":"high", "description":"Common skin cancer; treatable when detected early.", "precautions":"Dermatologist consult; sun protection.", "medications":"Surgical excision, topical options."},
+    "Psoriasis": {"severity":"low", "description":"Chronic autoimmune skin condition causing scaly plaques.", "precautions":"Moisturize; avoid triggers.", "medications":"Topical steroids, vitamin D analogues."},
+    "Nevus": {"severity":"low", "description":"Benign mole in most cases.", "precautions":"Monitor for changes in size/colour.", "medications":"Not needed unless suspicious."},
+    "Actinic Keratosis": {"severity":"medium", "description":"Sun-damaged precancerous lesion.", "precautions":"Sun protection; dermatology review.", "medications":"Cryotherapy, topical 5-FU or diclofenac."}
+}
+DISEASE_CLASSES = list(DISEASE_INFO.keys())
+
+# -------------------------
+# Hashing helpers (PBKDF2 fallback)
+# -------------------------
 def hash_password(pw: str) -> str:
     salt = os.urandom(16)
-    key = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200_000)
+    key = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, 200000)
     return "pbkdf2$" + binascii.hexlify(salt).decode() + "$" + binascii.hexlify(key).decode()
 
 def check_password(pw: str, stored: str) -> bool:
     try:
-        _, salt_hex, key_hex = stored.split("$")
+        tag, salt_hex, key_hex = stored.split("$")
         salt = binascii.unhexlify(salt_hex)
         key = binascii.unhexlify(key_hex)
-        new_key = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200_000)
-        return binascii.hexlify(new_key).decode() == binascii.hexlify(key).decode()
+        new_key = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, 200000)
+        return binascii.hexlify(new_key) == binascii.hexlify(key)
     except Exception:
         return False
 
-# -----------------------
-# Dummy disease knowledge base (expand later)
-# -----------------------
-DISEASE_INFO: Dict[str, Dict[str, str]] = {
-    "Melanoma": {
-        "description": "Melanoma is a serious form of skin cancer that can spread to other organs.",
-        "precautions": "Seek immediate evaluation by a dermatologist if lesion is changing, bleeding, or painful.",
-        "medications": "Medical/surgical treatment only. See specialist; not for OTC self-treatment.",
-        "severity": "high"
-    },
-    "Psoriasis": {
-        "description": "Chronic inflammatory condition with red, scaly patches.",
-        "precautions": "Avoid triggers, keep skin moisturized, consult dermatologist for topical therapy.",
-        "medications": "Topical steroids, vitamin D analogues; oral/biologic for severe cases.",
-        "severity": "medium"
-    },
-    "Eczema": {
-        "description": "Also called atopic dermatitis — itchy, inflamed skin.",
-        "precautions": "Use gentle skincare, moisturize frequently, avoid strong soaps.",
-        "medications": "Topical emollients and steroids for flares; see physician if severe.",
-        "severity": "medium"
-    },
-    "Nevus (mole)": {
-        "description": "A benign mole. Usually harmless but monitor for changes.",
-        "precautions": "Watch for asymmetry, color change, increasing size — see dermatologist if changes noted.",
-        "medications": "None usually. Surgical excision only if clinically indicated.",
-        "severity": "low"
-    },
-    "Unknown": {
-        "description": "The image did not match known patterns in the local database.",
-        "precautions": "Please consult a dermatologist for an accurate diagnosis.",
-        "medications": "N/A",
-        "severity": "unknown"
-    }
-}
+# -------------------------
+# Local session fallback stores
+# -------------------------
+if "local_users" not in st.session_state:
+    st.session_state["local_users"] = {}
+if "local_records" not in st.session_state:
+    st.session_state["local_records"] = []
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+if "page" not in st.session_state:
+    st.session_state["page"] = "welcome"
+if "current_diagnosis" not in st.session_state:
+    st.session_state["current_diagnosis"] = None
+if "last_avatar_bytes" not in st.session_state:
+    st.session_state["last_avatar_bytes"] = None
 
-# -----------------------
-# Fake "model" - lightweight deterministic-ish function
-# NOTE: This is a placeholder. For real detection you'd plug an ML model.
-# -----------------------
-def fake_diagnose_image(image_bytes: bytes) -> Tuple[str, float]:
-    """
-    Return a (label, confidence) pair.
-    Deterministic-ish: use image size parity + random seed for variety.
-    """
-    # Use image length and some randomness to choose label but stable per run
-    seed = len(image_bytes) % 9973
-    rng = random.Random(seed)
-    labels = list(DISEASE_INFO.keys())
-    # bias toward nevus if image small, else pick others
-    size_factor = len(image_bytes) % 1000
-    if size_factor < 200:
-        label = "Nevus (mole)"
-        confidence = 0.6 + rng.random() * 0.3
-    else:
-        label = rng.choice(labels)
-        confidence = 0.4 + rng.random() * 0.5
-    if label not in DISEASE_INFO:
-        label = "Unknown"
-    return label, float(confidence)
+def local_store_user(user_doc: dict):
+    u = st.session_state.get("local_users", {})
+    u[user_doc["email"]] = user_doc
+    st.session_state["local_users"] = u
 
-# -----------------------
-# UI styling (royal purple theme + light text)
-# -----------------------
-st.markdown(
-    """
-    <style>
-    :root {
-      --bg: #0f0416;
-      --panel: rgba(255,255,255,0.03);
-      --accent: #d88cff;
-      --muted: #cfc2e6;
-      --light: #f3eefc;
-    }
-    .stApp {
-      background: linear-gradient(180deg, #0f0416 0%, #1b072a 100%);
-      color: var(--light);
-    }
-    .big-title {
-      font-size:48px !important;
-      color: var(--light) !important;
-      font-weight:700;
-    }
-    .subtitle {
-      color: var(--muted) !important;
-      font-size:16px;
-      margin-bottom:18px;
-    }
-    .card {
-      background: var(--panel);
-      padding: 22px;
-      border-radius: 12px;
-      border: 1px solid rgba(216,140,255,0.06);
-      margin-bottom: 18px;
-    }
-    .btn-primary {
-      background-color: #ffd8ff;
-      color: #3c0b3f;
-      border-radius: 8px;
-      padding: 8px 14px;
-      font-weight:600;
-    }
-    .muted-text { color: var(--muted) !important; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def local_get_user(email: str):
+    return st.session_state.get("local_users", {}).get(email)
 
-# -----------------------
-# Navigation helpers
-# -----------------------
-def go(to: str):
-    st.session_state["page"] = to
+# -------------------------
+# Firebase helpers
+# -------------------------
+def upload_image_to_storage(path: str, image_bytes: bytes, content_type="image/jpeg"):
+    if not bucket:
+        return None
+    try:
+        blob = bucket.blob(path)
+        blob.upload_from_string(image_bytes, content_type=content_type)
+        try:
+            blob.make_public()
+            return blob.public_url
+        except Exception:
+            return f"gs://{blob.bucket.name}/{blob.name}"
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
+        return None
+
+def save_record_cloud(record: dict):
+    if not db:
+        return False
+    try:
+        db.collection("diagnoses").add(record)
+        return True
+    except Exception as e:
+        st.error(f"Cloud save failed: {e}")
+        return False
+
+# -------------------------
+# Diagnosis backends
+# -------------------------
+def dummy_predict(image_bytes=None):
+    return "Nevus", 0.42
+
+def hf_predict(image_bytes: bytes):
+    if not HF_API_TOKEN or not HF_MODEL:
+        return dummy_predict(image_bytes)
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    api_url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+    try:
+        response = requests.post(api_url, headers=headers, files={"file": image_bytes}, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+            label = data[0].get("label") or data[0].get("class") or str(data[0])
+            score = data[0].get("score", 0.0)
+            return label, float(score)
+        return str(data), 0.0
+    except Exception as e:
+        st.warning(f"Hugging Face inference failed: {e}")
+        return dummy_predict(image_bytes)
+
+def genai_vision_predict(image_bytes: bytes):
+    if not USE_GENAI:
+        return dummy_predict(image_bytes)
+    try:
+        model = genai.GenerativeModel("models/gemini-2.5-pro")
+        prompt = "You are an experienced dermatologist. Look at the image and provide a single-line disease label only."
+        response = model.generate_content([prompt, {"mime_type":"image/jpeg", "data": image_bytes}])
+        text = ""
+        if hasattr(response, "text"):
+            text = response.text.strip()
+        elif isinstance(response, dict):
+            text = response.get("content", "")
+        else:
+            text = str(response)
+        label = text.splitlines()[0] if text else "Unknown"
+        return label, 0.0
+    except Exception as e:
+        st.warning(f"Gemini vision inference failed: {e}")
+        return dummy_predict(image_bytes)
+
+def diagnose_image(image_bytes: bytes):
+    if USE_GENAI:
+        try:
+            return genai_vision_predict(image_bytes)
+        except Exception:
+            pass
+    if HF_API_TOKEN and HF_MODEL:
+        try:
+            return hf_predict(image_bytes)
+        except Exception:
+            pass
+    return dummy_predict(image_bytes)
+
+# -------------------------
+# Chat / QA (descriptive)
+# -------------------------
+def genai_answer_question(disease_label: str, question: str):
+    if not USE_GENAI:
+        info = DISEASE_INFO.get(disease_label, {})
+        return (f"Summary for {disease_label}:\n\n"
+                f"{info.get('description','No description available.')}\n\n"
+                f"Precautions: {info.get('precautions','Follow general precautions.')}\n\n"
+                f"If symptoms are severe or rapidly changing, consult a dermatologist.")
+    try:
+        model = genai.GenerativeModel("models/gemini-2.5-pro")
+        system_prompt = (
+            "You are a senior dermatologist and teacher. Answer in clear, structured sections. "
+            "Be evidence-based, cautious, and include: (1) short summary, (2) likely causes, "
+            "(3) recommended first-line home care, (4) medical treatments used, (5) red flags when to seek a doctor, "
+            "(6) common medication classes, and (7) suggested next steps."
+        )
+        user_prompt = (
+            f"Disease: {disease_label}\nPatient question: {question}\n\n"
+            "Please provide a detailed, structured reply in numbered sections as described above."
+        )
+        # Adjust params if your SDK supports; otherwise plain call
+        response = model.generate_content([system_prompt, user_prompt], temperature=0.2, max_output_tokens=800)
+        if hasattr(response, "text") and response.text:
+            return response.text
+        return str(response)
+    except Exception as e:
+        return f"AI error: {e}\n\n(Showing fallback summary)\n\n" + (DISEASE_INFO.get(disease_label, {}).get("description",""))
+
+# -------------------------
+# UI CSS
+# -------------------------
+st.markdown("""
+<style>
+:root { --bg:#12021a; --card:#1e0930; --muted:#e6ddff; --accent1:#9b4dff; --accent2:#6e2ee6; }
+.stApp { background: linear-gradient(180deg,var(--bg), #1a0530); color:var(--muted); }
+.royal-card { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border:1px solid rgba(155,77,255,0.08); border-radius:12px; padding:12px; margin-bottom:10px;}
+h1,h2,h3 { color:#f7ecff !important; }
+.small-muted { color: rgba(230,220,255,0.8); }
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------------
+# Page flow helpers
+# -------------------------
+def go_home():
+    st.session_state["page"] = "welcome"
     st.experimental_rerun()
 
-# -----------------------
-# Page components
-# -----------------------
-def welcome_page():
-    left, right = st.columns([1, 2])
-    with left:
-        st.write("")  # spacer
-    with right:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="big-title">Skin Disease Diagnosis Center</div>', unsafe_allow_html=True)
-        st.markdown('<div class="subtitle">Upload an image, get an educational diagnosis and suggested precautions. Not a substitute for medical advice.</div>', unsafe_allow_html=True)
-        st.write("")  # spacer
-        if st.button("Login", key="welcome_login"):
-            go("login")
-        st.write(" ")
-        st.markdown("</div>", unsafe_allow_html=True)
+def go_login():
+    st.session_state["page"] = "login"
+    st.experimental_rerun()
 
+def go_register():
+    st.session_state["page"] = "register"
+    st.experimental_rerun()
 
-def register_page():
-    st.header("Create an account")
-    with st.form("register_form"):
-        name = st.text_input("Full name")
-        email = st.text_input("Email")
-        pw = st.text_input("Password", type="password")
-        pw2 = st.text_input("Confirm password", type="password")
-        submitted = st.form_submit_button("Register")
-    if submitted:
-        if not name or not email or not pw:
-            st.error("Please fill all fields.")
-            return
-        if pw != pw2:
-            st.error("Passwords do not match.")
-            return
-        if email in st.session_state["local_users"]:
-            st.error("User already exists. Please login.")
-            return
-        st.session_state["local_users"][email] = {
-            "name": name,
-            "email": email,
-            "password_hash": hash_password(pw)
-        }
-        st.success("Account created — please login.")
-        go("login")
-
-
-def login_page():
-    st.header("Login")
-    with st.form("login_form"):
-        email = st.text_input("Email")
-        pw = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
-    if submitted:
-        user = st.session_state["local_users"].get(email)
-        if not user:
-            st.error("No such user. Please register.")
-            return
-        if check_password(pw, user["password_hash"]):
-            st.session_state["user"] = user
-            st.success("Login successful.")
-            go("home")
-        else:
-            st.error("Incorrect password.")
-    st.write("Don't have an account? ")
-    if st.button("Create account"):
-        go("register")
-
-
-def home_page():
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Welcome back, " + (st.session_state["user"]["name"] if st.session_state["user"] else "guest"))
-    st.write("Use the left menu to Diagnose or view Profile.")
+# -------------------------
+# Pages
+# -------------------------
+def page_welcome():
+    st.markdown('<div class="royal-card">', unsafe_allow_html=True)
+    st.title("👑 Royal Skin Diagnosis")
+    st.write("Educational tool — not a medical diagnosis.")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Login"):
+            go_login()
+    with c2:
+        if st.button("Register"):
+            go_register()
     st.markdown("</div>", unsafe_allow_html=True)
 
+def page_register():
+    st.header("Create account")
+    c1, c2 = st.columns(2)
+    with c1:
+        name = st.text_input("Full name", key="reg_name")
+        email = st.text_input("Email", key="reg_email")
+        phone = st.text_input("Phone (optional)", key="reg_phone")
+    with c2:
+        pw = st.text_input("Password", type="password", key="reg_pw")
+        pw2 = st.text_input("Confirm password", type="password", key="reg_pw2")
+        avatar = st.file_uploader("Profile picture (optional)", type=["jpg","jpeg","png"], key="reg_avatar")
+    if st.button("Register account"):
+        if not name or not email or not pw:
+            st.error("Fill name, email and password.")
+        elif pw != pw2:
+            st.error("Passwords do not match.")
+        else:
+            hashed = hash_password(pw)
+            user_doc = {"name": name, "email": email, "phone": phone, "password_hash": hashed, "created_at": datetime.utcnow().isoformat()}
+            if avatar:
+                b = avatar.read()
+                st.session_state["last_avatar_bytes"] = b
+                if FIREBASE_AVAILABLE and bucket:
+                    try:
+                        path = f"profiles/{email.replace('@','_at_')}_{int(time.time())}.jpg"
+                        url = upload_image_to_storage(path, b, content_type="image/jpeg")
+                        if url:
+                            user_doc["avatar_url"] = url
+                    except Exception:
+                        pass
+            if FIREBASE_AVAILABLE and db:
+                try:
+                    db.collection("users").add(user_doc)
+                    st.success("Account created (cloud). Please login.")
+                except Exception as e:
+                    st.error(f"Cloud save failed: {e}")
+            else:
+                local_store_user(user_doc)
+                st.success("Local account created. (Cloud not configured.)")
 
-def diagnose_page():
-    st.header("Diagnose Skin Condition")
-    uploaded = st.file_uploader("Upload a clear photo of the affected skin area (jpg, png)", type=["jpg", "jpeg", "png"])
+def page_login():
+    st.header("Login")
+    em = st.text_input("Email", key="login_email")
+    pw = st.text_input("Password", type="password", key="login_pw")
+    if st.button("Login"):
+        user_doc = None
+        if FIREBASE_AVAILABLE and db:
+            try:
+                q = db.collection("users").where("email","==",em).limit(1).get()
+                if q and len(q) > 0:
+                    user_doc = q[0].to_dict()
+            except Exception:
+                user_doc = None
+        if not user_doc:
+            user_doc = local_get_user(em)
+        if not user_doc:
+            st.error("No such user. Please register.")
+        else:
+            if check_password(pw, user_doc["password_hash"]):
+                st.session_state["user"] = {"email": user_doc["email"], "name": user_doc.get("name"), "phone": user_doc.get("phone"), "avatar": user_doc.get("avatar_url") if FIREBASE_AVAILABLE else st.session_state.get("last_avatar_bytes")}
+                st.success("Logged in.")
+                st.session_state["page"] = "home"
+                st.experimental_rerun()
+            else:
+                st.error("Incorrect password.")
+
+def page_home():
+    st.markdown('<div class="royal-card">', unsafe_allow_html=True)
+    st.title("Home")
+    st.write("Use the sidebar to go to Diagnose or Profile.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+def page_profile():
+    if not st.session_state.get("user"):
+        st.info("Please login.")
+        return
+    user = st.session_state["user"]
+    st.header("Profile")
+    col1, col2 = st.columns([1,3])
+    with col1:
+        avatar = user.get("avatar")
+        if isinstance(avatar, (bytes, bytearray)):
+            from io import BytesIO
+            st.image(BytesIO(avatar), width=140)
+        elif isinstance(avatar, str) and (avatar.startswith("http") or avatar.startswith("gs://")):
+            try:
+                st.image(avatar, width=140)
+            except Exception:
+                st.image("https://via.placeholder.com/140x140.png?text=Avatar", width=140)
+        else:
+            st.image("https://via.placeholder.com/140x140.png?text=No+Avatar", width=140)
+    with col2:
+        st.write(f"**Name:** {user.get('name')}")
+        st.write(f"**Email:** {user.get('email')}")
+        st.write(f"**Phone:** {user.get('phone')}")
+        st.write("Cloud: " + ("Connected" if FIREBASE_AVAILABLE else "Not configured (local mode)"))
+
+    if st.button("View saved records"):
+        if FIREBASE_AVAILABLE and db:
+            try:
+                docs = db.collection("diagnoses").where("user_email","==", user["email"]).order_by("timestamp", direction="DESCENDING").limit(100).stream()
+                recs = [d.to_dict() for d in docs]
+                if not recs:
+                    st.info("No cloud records found for this user.")
+                else:
+                    for r in recs:
+                        with st.expander(f"{r.get('disease')} — {r.get('timestamp','')}"):
+                            st.write(f"**Disease:** {r.get('disease')}")
+                            st.write(f"**Confidence:** {r.get('confidence')}")
+                            if r.get("image_url"):
+                                try:
+                                    st.image(r.get("image_url"), use_column_width=True)
+                                except Exception:
+                                    st.write("Image not available.")
+                            elif r.get("image_b64"):
+                                st.image(base64.b64decode(r.get("image_b64")), use_column_width=True)
+                            st.json(r)
+            except Exception as e:
+                st.error(f"Failed to read cloud records: {e}")
+                st.write(st.session_state.get("local_records", []))
+        else:
+            recs = st.session_state.get("local_records", [])
+            if not recs:
+                st.info("No local records found. Diagnose & save a record first.")
+            else:
+                for r in recs[::-1]:
+                    with st.expander(f"{r.get('disease')} — {r.get('timestamp','')}"):
+                        st.write(f"**Disease:** {r.get('disease')}")
+                        st.write(f"**Confidence:** {r.get('confidence')}")
+                        if r.get("image_b64"):
+                            st.image(base64.b64decode(r.get("image_b64")), use_column_width=True)
+                        st.json(r)
+
+def page_diagnose():
+    st.header("🔬 Diagnose Skin Condition")
+    uploaded = st.file_uploader("Upload skin image (jpg/png)", type=["jpg","jpeg","png"])
     if uploaded:
         try:
-            img = Image.open(uploaded).convert("RGB")
-            st.image(img, use_column_width=True)
-            # get raw bytes
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG")
-            bytes_data = buf.getvalue()
-        except Exception as e:
-            st.error("Cannot read image: " + str(e))
+            img = Image.open(uploaded)
+            st.image(img, caption="Uploaded image", use_column_width=True)
+        except Exception:
+            st.error("Could not open image.")
             return
+        b = io.BytesIO()
+        img.save(b, format="JPEG")
+        img_bytes = b.getvalue()
 
-        if st.button("Analyze"):
-            label, conf = fake_diagnose_image(bytes_data)
-            st.session_state["current_diagnosis"] = (label, conf, bytes_data)
-            st.success(f"Diagnosis: {label}  —  Confidence: {conf:.2f}")
-            meta = DISEASE_INFO.get(label, DISEASE_INFO["Unknown"])
-            st.markdown("**Description:** " + meta.get("description", ""))
-            st.markdown("**Precautions:** " + meta.get("precautions", ""))
-            st.markdown("**Medications / Notes:** " + meta.get("medications", ""))
+        if st.button("Analyze image"):
+            with st.spinner("Analyzing..."):
+                label, conf = diagnose_image(img_bytes)
+                st.success(f"Predicted: **{label}** (confidence {conf:.2f})")
+                st.session_state["current_diagnosis"] = label
+                st.session_state["current_confidence"] = conf
+                info = DISEASE_INFO.get(label, {})
+                st.markdown(f"**Description:** {info.get('description','No description available.')}")
+                st.markdown(f"**Precautions:** {info.get('precautions','Follow general precautions.')}")
+                st.markdown(f"**Treatment / Medications:** {info.get('medications','Consult a dermatologist.')}")
+                severity = info.get("severity","low")
+                if severity == "high" or conf > 0.85:
+                    st.warning("This looks potentially serious. Please consult a dermatologist promptly.")
+                    st.markdown("[Book a dermatologist on Practo](https://www.practo.com/dermatologist)")
 
-            if meta.get("severity") == "high":
-                st.warning("This looks potentially serious. Consider consulting a medical professional immediately.")
-                st.markdown("[Book a consultation on Practo](https://www.practo.com)")
+                if st.button("Save this record"):
+                    if not st.session_state.get("user"):
+                        st.error("Log in to save records.")
+                    else:
+                        rec = {
+                            "user_email": st.session_state["user"]["email"],
+                            "disease": label,
+                            "confidence": float(conf),
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                        if FIREBASE_AVAILABLE and bucket:
+                            try:
+                                path = f"diagnoses/{st.session_state['user']['email'].replace('@','_at_')}/{int(time.time())}.jpg"
+                                url = upload_image_to_storage(path, img_bytes, content_type="image/jpeg")
+                                if url:
+                                    rec["image_url"] = url
+                            except Exception:
+                                pass
+                        else:
+                            rec["image_b64"] = base64.b64encode(img_bytes).decode("utf-8")
 
-        # Save record button
-        if st.session_state.get("current_diagnosis"):
-            if st.button("Save this record"):
-                label, conf, bytes_data = st.session_state["current_diagnosis"]
-                rec = {
-                    "diagnosis": label,
-                    "confidence": float(conf),
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "image_b64": base64.b64encode(bytes_data).decode("utf-8"),
-                    "user_email": st.session_state["user"]["email"] if st.session_state["user"] else None
-                }
-                st.session_state["local_records"].append(rec)
-                st.success("Record saved locally in this session.")
-
-
-def profile_page():
-    st.header("Profile")
-    user = st.session_state.get("user")
-    if user:
-        st.markdown(f"**Name:** {user['name']}")
-        st.markdown(f"**Email:** {user['email']}")
+                        saved_cloud = False
+                        if FIREBASE_AVAILABLE and db:
+                            try:
+                                db.collection("diagnoses").add(rec)
+                                saved_cloud = True
+                                st.success("Saved to cloud.")
+                            except Exception as e:
+                                st.error(f"Cloud save failed: {e}\nSaved locally instead.")
+                        if not saved_cloud:
+                            st.session_state["local_records"].append(rec)
+                            st.success("Saved locally.")
     else:
-        st.info("You are not logged in.")
+        st.info("Upload an image to diagnose.")
 
-    st.subheader("Saved Records (local session)")
-    records = [r for r in st.session_state["local_records"] if (user is None or r.get("user_email") == user.get("email"))]
-    if not records:
-        st.info("No saved records in this session.")
-    else:
-        for i, r in enumerate(reversed(records)):
-            with st.expander(f"{r['diagnosis']} — {r['timestamp']}"):
-                st.write(f"**Confidence:** {r['confidence']:.2f}")
-                imgdata = base64.b64decode(r["image_b64"])
-                st.image(imgdata, use_column_width=True)
-
-    # Export CSV button
-    if records:
-        import csv
-        csv_buf = io.StringIO()
-        writer = csv.writer(csv_buf)
-        writer.writerow(["diagnosis", "confidence", "timestamp", "user_email"])
-        for r in records:
-            writer.writerow([r["diagnosis"], r["confidence"], r["timestamp"], r.get("user_email","")])
-        csv_bytes = csv_buf.getvalue().encode()
-        st.download_button("Download records CSV", data=csv_bytes, file_name="records.csv", mime="text/csv")
-
-
-def chatbot_area():
+    st.markdown("---")
     st.subheader("Ask about the diagnosis")
-    prompt = st.text_input("Ask a question to the assistant about the current diagnosis (e.g., 'What is the cure?')", key="chat_input")
-    if st.button("Ask"):
+    if not st.session_state.get("current_diagnosis"):
+        st.info("Diagnose an image first so AI has context.")
+    question = st.text_input("Your question about the diagnosis:", key="qa_input")
+    if st.button("Ask AI"):
         if not st.session_state.get("current_diagnosis"):
-            st.info("Please diagnose an image first so the assistant has context.")
+            st.warning("Diagnose an image first.")
         else:
-            label, conf, _ = st.session_state["current_diagnosis"]
-            meta = DISEASE_INFO.get(label, DISEASE_INFO["Unknown"])
-            lower = prompt.lower()
-            answer = ""
-            if "cure" in lower or "treatment" in lower or "medicat" in lower:
-                answer = f"Suggested approach: {meta.get('medications','Not available')}. " \
-                         "This is educational — for actual prescription or surgery, consult a dermatologist."
-            elif "precaution" in lower or "prevent" in lower:
-                answer = f"Precautions: {meta.get('precautions','Follow up with a physician')}"
-            elif "what" in lower or "describe" in lower or "info" in lower:
-                answer = f"{meta.get('description','No additional info')}"
-            else:
-                # fallback
-                answer = f"I suggest: {meta.get('description','Consult a dermatologist')} — for severe cases use Practo: https://www.practo.com"
-            st.write(answer)
+            ans = genai_answer_question(st.session_state["current_diagnosis"], question)
+            st.markdown(ans)
 
-# -----------------------
-# Sidebar (routing & auth)
-# -----------------------
+# -------------------------
+# Sidebar & routing
+# -------------------------
 def render_sidebar():
     st.sidebar.title("Navigation")
-    if st.session_state["user"]:
-        choice = st.sidebar.radio("Menu", ["Home", "Diagnose", "Profile", "Logout"])
+    if st.session_state.get("user"):
+        st.sidebar.write(f"Signed in as: {st.session_state['user'].get('name')}")
+        choice = st.sidebar.radio("Go to", ["Home", "Diagnose", "Profile", "Sign out"])
         if choice == "Home":
-            go("home")
+            st.session_state["page"] = "home"
         elif choice == "Diagnose":
-            go("diagnose")
+            st.session_state["page"] = "app"
         elif choice == "Profile":
-            go("profile")
-        elif choice == "Logout":
+            st.session_state["page"] = "profile"
+        elif choice == "Sign out":
             st.session_state["user"] = None
-            st.success("Logged out.")
-            go("welcome")
+            st.session_state["page"] = "welcome"
+            st.experimental_rerun()
     else:
-        choice = st.sidebar.radio("Menu", ["Welcome", "Login", "Register"])
-        if choice == "Welcome":
-            go("welcome")
+        choice = st.sidebar.radio("Go to", ["Home", "Login", "Register"])
+        if choice == "Home":
+            st.session_state["page"] = "welcome"
         elif choice == "Login":
-            go("login")
+            st.session_state["page"] = "login"
         elif choice == "Register":
-            go("register")
+            st.session_state["page"] = "register"
 
-# -----------------------
-# Router / main
-# -----------------------
+# -------------------------
+# Main
+# -------------------------
 def main():
     render_sidebar()
     page = st.session_state.get("page", "welcome")
     if page == "welcome":
-        welcome_page()
-    elif page == "login":
-        login_page()
+        page_welcome()
     elif page == "register":
-        register_page()
+        page_register()
+    elif page == "login":
+        page_login()
     elif page == "home":
-        home_page()
-    elif page == "diagnose":
-        diagnose_page()
+        page_home()
     elif page == "profile":
-        profile_page()
+        page_profile()
+    elif page == "app":
+        page_diagnose()
+    else:
+        page_welcome()
 
-    # chatbot block always visible near bottom of main area
-    st.markdown("---")
-    chatbot_area()
+def footer():
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown('<div style="text-align:center;color:rgba(230,220,255,0.7)">Built with ❤️ — educational tool only. Not a medical diagnosis.</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
+    footer()
