@@ -1,12 +1,5 @@
-# app.py
-"""
-Royal Skin Diagnosis - Full working Streamlit app (single-file)
-- No torch dependency (safe for Streamlit Cloud)
-- PBKDF2 password hashing fallback (no bcrypt required)
-- Gemini/Hugging Face optional integration for diagnosis & chat
-- Firebase Firestore + Storage optional (controlled by secrets)
-- Profile view shows saved records (cloud or local) and avatars
-"""
+# app.py — safer / hardened version of your Royal Skin Diagnosis app
+# Overwrite your current app.py with this file.
 
 import os
 import io
@@ -16,6 +9,7 @@ import base64
 import hashlib
 import binascii
 from datetime import datetime
+from typing import Optional, Tuple
 
 import streamlit as st
 from PIL import Image
@@ -40,13 +34,17 @@ FIREBASE_STORAGE_BUCKET = st.secrets.get("FIREBASE_STORAGE_BUCKET") if "FIREBASE
 # Optional Google Generative AI (Gemini)
 # -------------------------
 USE_GENAI = False
+genai = None
 if GENAI_API_KEY:
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=GENAI_API_KEY)
+        import google.generativeai as genai_mod
+        genai_mod.configure(api_key=GENAI_API_KEY)
+        genai = genai_mod
         USE_GENAI = True
     except Exception:
+        # leave USE_GENAI False if import/config fails
         USE_GENAI = False
+        genai = None
 
 # -------------------------
 # Optional Firebase init (lazy)
@@ -55,11 +53,14 @@ FIREBASE_AVAILABLE = False
 db = None
 bucket = None
 
-@st.cache_resource(show_spinner=False)
-def init_firebase():
+def try_init_firebase():
+    """
+    Lazy init for firebase. Return (db, bucket) or (None, None).
+    Do NOT call Streamlit UI functions in this function at import time.
+    """
     global FIREBASE_AVAILABLE, db, bucket
     if not (FIREBASE_SERVICE_ACCOUNT_JSON and FIREBASE_STORAGE_BUCKET):
-        return None
+        return None, None
     try:
         import firebase_admin
         from firebase_admin import credentials, firestore, storage as fb_storage
@@ -70,18 +71,23 @@ def init_firebase():
         db_local = firestore.client()
         bucket_local = fb_storage.bucket()
         FIREBASE_AVAILABLE = True
+        db = db_local
+        bucket = bucket_local
         return db_local, bucket_local
-    except Exception as e:
-        # Do not crash — return None and fallback to local storage
-        st.warning("Firebase init failed (continuing with local storage).")
-        return None
+    except Exception:
+        # initialization failed, fallback to local only
+        FIREBASE_AVAILABLE = False
+        db = None
+        bucket = None
+        return None, None
 
-_firebase = init_firebase()
+# do not call UI from here; call later to surface any message
+_firebase = try_init_firebase()
 if _firebase:
     db, bucket = _firebase
 
 # -------------------------
-# Disease metadata (expand as you like)
+# Disease metadata
 # -------------------------
 DISEASE_INFO = {
     "Melanoma": {"severity":"high", "description":"Potentially life-threatening skin cancer.", "precautions":"Avoid sun; see dermatologist urgently.", "medications":"Surgery/oncology-managed therapies."},
@@ -90,7 +96,6 @@ DISEASE_INFO = {
     "Nevus": {"severity":"low", "description":"Benign mole in most cases.", "precautions":"Monitor for changes in size/colour.", "medications":"Not needed unless suspicious."},
     "Actinic Keratosis": {"severity":"medium", "description":"Sun-damaged precancerous lesion.", "precautions":"Sun protection; dermatology review.", "medications":"Cryotherapy, topical 5-FU or diclofenac."}
 }
-DISEASE_CLASSES = list(DISEASE_INFO.keys())
 
 # -------------------------
 # Hashing helpers (PBKDF2 fallback)
@@ -106,7 +111,8 @@ def check_password(pw: str, stored: str) -> bool:
         salt = binascii.unhexlify(salt_hex)
         key = binascii.unhexlify(key_hex)
         new_key = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, 200000)
-        return binascii.hexlify(new_key) == binascii.hexlify(key)
+        # compare hex strings explicitly (safer and clear)
+        return binascii.hexlify(new_key).decode() == binascii.hexlify(key).decode()
     except Exception:
         return False
 
@@ -131,17 +137,18 @@ def local_store_user(user_doc: dict):
     u[user_doc["email"]] = user_doc
     st.session_state["local_users"] = u
 
-def local_get_user(email: str):
+def local_get_user(email: str) -> Optional[dict]:
     return st.session_state.get("local_users", {}).get(email)
 
 # -------------------------
-# Firebase helpers
+# Firebase helpers (defensive)
 # -------------------------
-def upload_image_to_storage(path: str, image_bytes: bytes, content_type="image/jpeg"):
+def upload_image_to_storage(path: str, image_bytes: bytes, content_type="image/jpeg") -> Optional[str]:
     if not bucket:
         return None
     try:
         blob = bucket.blob(path)
+        # upload from bytes
         blob.upload_from_string(image_bytes, content_type=content_type)
         try:
             blob.make_public()
@@ -149,10 +156,11 @@ def upload_image_to_storage(path: str, image_bytes: bytes, content_type="image/j
         except Exception:
             return f"gs://{blob.bucket.name}/{blob.name}"
     except Exception as e:
+        # do not crash app
         st.error(f"Upload failed: {e}")
         return None
 
-def save_record_cloud(record: dict):
+def save_record_cloud(record: dict) -> bool:
     if not db:
         return False
     try:
@@ -163,51 +171,65 @@ def save_record_cloud(record: dict):
         return False
 
 # -------------------------
-# Diagnosis backends
+# Diagnosis backends (fixed HF request usage)
 # -------------------------
-def dummy_predict(image_bytes=None):
+def dummy_predict(image_bytes: bytes) -> Tuple[str, float]:
     return "Nevus", 0.42
 
-def hf_predict(image_bytes: bytes):
+def hf_predict(image_bytes: bytes) -> Tuple[str, float]:
     if not HF_API_TOKEN or not HF_MODEL:
         return dummy_predict(image_bytes)
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
     api_url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
     try:
-        response = requests.post(api_url, headers=headers, files={"file": image_bytes}, timeout=60)
+        # files expects tuple like ("file", ("filename", data, "image/jpeg"))
+        files = {"file": ("image.jpg", image_bytes, "image/jpeg")}
+        response = requests.post(api_url, headers=headers, files=files, timeout=60)
         response.raise_for_status()
         data = response.json()
         if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
             label = data[0].get("label") or data[0].get("class") or str(data[0])
             score = data[0].get("score", 0.0)
             return label, float(score)
+        # sometimes HF returns dict with label keys
+        if isinstance(data, dict):
+            # try common patterns
+            if "error" in data:
+                st.warning(f"HF error: {data.get('error')}")
+                return dummy_predict(image_bytes)
+            # fallback: return stringified body
+            return str(data), 0.0
         return str(data), 0.0
     except Exception as e:
+        # do not crash app; warn user
         st.warning(f"Hugging Face inference failed: {e}")
         return dummy_predict(image_bytes)
 
-def genai_vision_predict(image_bytes: bytes):
-    if not USE_GENAI:
+def genai_vision_predict(image_bytes: bytes) -> Tuple[str, float]:
+    if not USE_GENAI or genai is None:
         return dummy_predict(image_bytes)
     try:
+        # Build a short prompt and send single image content if SDK supports mixed inputs.
         model = genai.GenerativeModel("models/gemini-2.5-pro")
         prompt = "You are an experienced dermatologist. Look at the image and provide a single-line disease label only."
+        # Use safest API shape: if SDK supports images, it may accept dict entries — catch exceptions
         response = model.generate_content([prompt, {"mime_type":"image/jpeg", "data": image_bytes}])
         text = ""
-        if hasattr(response, "text"):
+        if hasattr(response, "text") and response.text:
             text = response.text.strip()
         elif isinstance(response, dict):
             text = response.get("content", "")
         else:
             text = str(response)
-        label = text.splitlines()[0] if text else "Unknown"
+        label = text.splitlines()[0].strip() if text else "Unknown"
         return label, 0.0
     except Exception as e:
         st.warning(f"Gemini vision inference failed: {e}")
         return dummy_predict(image_bytes)
 
-def diagnose_image(image_bytes: bytes):
-    if USE_GENAI:
+def diagnose_image(image_bytes: bytes) -> Tuple[str, float]:
+    # priority: Gemini vision -> HF model -> dummy
+    if USE_GENAI and genai is not None:
         try:
             return genai_vision_predict(image_bytes)
         except Exception:
@@ -222,8 +244,8 @@ def diagnose_image(image_bytes: bytes):
 # -------------------------
 # Chat / QA (descriptive)
 # -------------------------
-def genai_answer_question(disease_label: str, question: str):
-    if not USE_GENAI:
+def genai_answer_question(disease_label: str, question: str) -> str:
+    if not USE_GENAI or genai is None:
         info = DISEASE_INFO.get(disease_label, {})
         return (f"Summary for {disease_label}:\n\n"
                 f"{info.get('description','No description available.')}\n\n"
@@ -241,7 +263,6 @@ def genai_answer_question(disease_label: str, question: str):
             f"Disease: {disease_label}\nPatient question: {question}\n\n"
             "Please provide a detailed, structured reply in numbered sections as described above."
         )
-        # Adjust params if your SDK supports; otherwise plain call
         response = model.generate_content([system_prompt, user_prompt], temperature=0.2, max_output_tokens=800)
         if hasattr(response, "text") and response.text:
             return response.text
@@ -281,6 +302,10 @@ def go_register():
 # Pages
 # -------------------------
 def page_welcome():
+    # Surface firebase/init status here (safe)
+    if FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_STORAGE_BUCKET:
+        if not (db and bucket):
+            st.info("Firebase keys provided but connection failed (cloud features disabled).")
     st.markdown('<div class="royal-card">', unsafe_allow_html=True)
     st.title("👑 Royal Skin Diagnosis")
     st.write("Educational tool — not a medical diagnosis.")
@@ -313,22 +338,25 @@ def page_register():
             hashed = hash_password(pw)
             user_doc = {"name": name, "email": email, "phone": phone, "password_hash": hashed, "created_at": datetime.utcnow().isoformat()}
             if avatar:
-                b = avatar.read()
-                st.session_state["last_avatar_bytes"] = b
-                if FIREBASE_AVAILABLE and bucket:
-                    try:
+                try:
+                    b = avatar.read()
+                    st.session_state["last_avatar_bytes"] = b
+                    if FIREBASE_AVAILABLE and bucket:
                         path = f"profiles/{email.replace('@','_at_')}_{int(time.time())}.jpg"
                         url = upload_image_to_storage(path, b, content_type="image/jpeg")
                         if url:
                             user_doc["avatar_url"] = url
-                    except Exception:
-                        pass
+                except Exception:
+                    # continue with local avatar fallback
+                    pass
             if FIREBASE_AVAILABLE and db:
                 try:
                     db.collection("users").add(user_doc)
                     st.success("Account created (cloud). Please login.")
                 except Exception as e:
                     st.error(f"Cloud save failed: {e}")
+                    local_store_user(user_doc)
+                    st.success("Saved locally instead.")
             else:
                 local_store_user(user_doc)
                 st.success("Local account created. (Cloud not configured.)")
@@ -376,7 +404,10 @@ def page_profile():
         avatar = user.get("avatar")
         if isinstance(avatar, (bytes, bytearray)):
             from io import BytesIO
-            st.image(BytesIO(avatar), width=140)
+            try:
+                st.image(BytesIO(avatar), width=140)
+            except Exception:
+                st.image("https://via.placeholder.com/140x140.png?text=Avatar", width=140)
         elif isinstance(avatar, str) and (avatar.startswith("http") or avatar.startswith("gs://")):
             try:
                 st.image(avatar, width=140)
@@ -412,7 +443,18 @@ def page_profile():
                             st.json(r)
             except Exception as e:
                 st.error(f"Failed to read cloud records: {e}")
-                st.write(st.session_state.get("local_records", []))
+                # fallback to local records display
+                recs_local = st.session_state.get("local_records", [])
+                if not recs_local:
+                    st.info("No local records.")
+                else:
+                    for r in recs_local[::-1]:
+                        with st.expander(f"{r.get('disease')} — {r.get('timestamp','')}"):
+                            st.write(f"**Disease:** {r.get('disease')}")
+                            st.write(f"**Confidence:** {r.get('confidence')}")
+                            if r.get("image_b64"):
+                                st.image(base64.b64decode(r.get("image_b64")), use_column_width=True)
+                            st.json(r)
         else:
             recs = st.session_state.get("local_records", [])
             if not recs:
