@@ -1,4 +1,5 @@
-streamlit==1.28.1
-Pillow==10.4.0
-requests>=2.0.0
-google-generative-ai==0.0.0  # only if you plan to use Gemini; otherwise leave empty
+# in your project folder
+echo -e "streamlit==1.28.1\nPillow==10.4.0\nrequests==2.31.0" > requirements.txt
+git add requirements.txt
+git commit -m "Replace requirements with minimal safe set"
+git push origin main
